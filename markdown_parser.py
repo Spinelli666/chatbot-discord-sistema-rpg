@@ -1,4 +1,3 @@
-import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -130,7 +129,8 @@ def search_question(question: str) -> list[Section]:
     if not _index:
         build_index()
     q_norm = _normalize(question)
-    words = [w for w in q_norm.split() if len(w) > 3]
+    # Use \w+ to strip punctuation (e.g. trailing "?") before filtering
+    words = [w for w in re.findall(r"\w+", q_norm) if len(w) > 3]
     scored: dict[int, int] = {}
     for i, section in enumerate(_index):
         content_norm = _normalize(section.content)
@@ -155,6 +155,157 @@ def available_categories() -> list[str]:
     if not _index:
         build_index()
     return sorted({s.category for s in _index})
+
+
+_STOP_WORDS: frozenset[str] = frozenset({
+    # artigos e preposições
+    "o", "a", "os", "as", "um", "uma",
+    "de", "do", "da", "dos", "das",
+    "em", "no", "na", "nos", "nas",
+    "ao", "aos", "pelo", "pela", "pelos", "pelas",
+    "por", "para", "sobre", "com", "sem", "entre", "ate",
+    # pronomes e demonstrativos
+    "me", "se", "lhe", "nos", "vos", "isso", "esse", "este", "essa", "esta",
+    # verbos auxiliares e comuns de perguntas
+    "e", "sao", "foi", "era", "ser", "estar", "ter", "ha",
+    "faz", "funciona", "significa", "serve", "explica", "explique",
+    "diga", "diz", "conta", "fala", "voce", "eu",
+    # palavras interrogativas
+    "que", "qual", "quais", "como", "quando", "onde", "quem", "quanto",
+    # termos genéricos do domínio (não são nomes próprios de mecânica)
+    "efeito", "habilidade", "regra", "sistema", "mecanica", "classe",
+    "propriedade", "tipo", "item", "coisa", "algo",
+})
+
+
+def _extract_query_terms(question: str) -> list[str]:
+    """Extract candidate search terms from a question, multi-word first."""
+    words = re.findall(r"\b\w+\b", question, re.UNICODE)
+    filtered = [w for w in words if _normalize(w) not in _STOP_WORDS and len(w) >= 2]
+
+    candidates: list[str] = []
+    for n in (3, 2):
+        for i in range(len(filtered) - n + 1):
+            candidates.append(" ".join(filtered[i : i + n]))
+    candidates.extend(filtered)
+    return candidates
+
+
+def _heading_matches(heading_norm: str, term_norm: str) -> bool:
+    """Return True if a heading text matches the search term.
+
+    Single-word terms require an exact heading match to avoid false positives
+    (e.g. "Dano" should not match "Dano de Queda"). Multi-word terms check
+    that every word of the term appears in the heading words.
+    """
+    if heading_norm == term_norm:
+        return True
+    if " " in term_norm:
+        heading_words = set(heading_norm.split())
+        return all(part in heading_words for part in term_norm.split())
+    return False
+
+
+_BOLD_ITEM_RE = re.compile(r"^(?:[-*]\s*)?\*\*(.+?)\*\*[:\s]?(.*)?$")
+
+
+def extract_exact_section(term: str, content: str) -> str | None:
+    """Return only the block that matches *term* inside *content*.
+
+    Strategy 1 — any-level heading (# ## ###): collects lines until the next
+    heading at the same or higher level, or a horizontal rule.
+
+    Strategy 2 — bold list item (**Term**: or - **Term**:): collects the item
+    line plus any continuation lines until the next bold item or heading.
+    """
+    term_norm = _normalize(term)
+    lines = content.splitlines()
+
+    # Strategy 1: heading match
+    for i, line in enumerate(lines):
+        m = re.match(r"^(#{1,3})\s+(.+)$", line)
+        if not m:
+            continue
+        level = len(m.group(1))
+        heading_norm = _normalize(m.group(2).strip())
+        if not _heading_matches(heading_norm, term_norm):
+            continue
+        body: list[str] = []
+        for next_line in lines[i + 1:]:
+            stop = re.match(r"^(#{1,3})\s+", next_line)
+            if stop and len(stop.group(1)) <= level:
+                break
+            if re.match(r"^-{3,}\s*$", next_line):
+                break
+            body.append(next_line)
+        body_text = "\n".join(body).strip()
+        heading_text = m.group(2).strip()
+        return f"**{heading_text}**\n\n{body_text}" if body_text else f"**{heading_text}**"
+
+    # Strategy 2: bold item match
+    for i, line in enumerate(lines):
+        m = _BOLD_ITEM_RE.match(line)
+        if not m:
+            continue
+        if not _heading_matches(_normalize(m.group(1).strip()), term_norm):
+            continue
+        body = [line]
+        for next_line in lines[i + 1:]:
+            if _BOLD_ITEM_RE.match(next_line):
+                break
+            if re.match(r"^#{1,3}\s+", next_line):
+                break
+            if re.match(r"^-{3,}\s*$", next_line):
+                break
+            body.append(next_line)
+        return "\n".join(body).strip()
+
+    return None
+
+
+def find_in_section(term: str, sections: list[Section]) -> str | None:
+    """Try to extract *term* as a subsection or bold item from each section."""
+    for section in sections:
+        result = extract_exact_section(term, section.content)
+        if result:
+            return result
+    return None
+
+
+def find_specific_content(sections: list[Section], question: str) -> str | None:
+    """Try to extract only the sub-item the question is asking about.
+
+    First searches within the sections returned by search_question. If nothing
+    matches, falls back to scanning the full index — this handles cases where the
+    defining section (e.g. "Efeitos Negativos") scored lower than sections that
+    merely *mention* the term (e.g. skills that apply "Atordoado").
+    """
+    if not _index:
+        build_index()
+
+    terms = _extract_query_terms(question)
+
+    # Pass 1: within the already-ranked sections (fast path)
+    for term in terms:
+        for section in sections:
+            result = extract_exact_section(term, section.content)
+            if result:
+                return result
+
+    # Pass 2: full-index scan.
+    # Skip terms that are themselves top-level section names — those should be
+    # answered via build_context (the full # Section), not a stray sub-heading
+    # found inside an unrelated section.
+    top_level_names = {_normalize(s.name) for s in _index}
+    for term in terms:
+        if _normalize(term) in top_level_names:
+            continue
+        for section in _index:
+            result = extract_exact_section(term, section.content)
+            if result:
+                return result
+
+    return None
 
 
 def format_section(section: Section, max_chars: int = 1600) -> str:
